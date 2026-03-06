@@ -1,7 +1,6 @@
 // src/server.js
 import express from "express";
 import QRCode from "qrcode";
-
 import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -13,12 +12,15 @@ const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "2mb" }));
 
+// ====== PORTA CERTA (Railway) ======
+const PORT = Number(process.env.PORT || 8080);
+
 // ====== Estado em memória ======
 let connState = "starting"; // starting | connecting | open | close
 let lastError = null;
 
-let latestQrText = null; // texto do QR (curto)
-let latestQrDataUrl = null; // base64 data:image/png
+let latestQrText = null;
+let latestQrDataUrl = null;
 
 let sock = null;
 
@@ -38,6 +40,19 @@ async function makeQrDataUrl(text) {
   }
 }
 
+function normalizarDestino(to) {
+  const valor = String(to || "").trim();
+
+  // grupo
+  if (valor.endsWith("@g.us")) return valor;
+
+  // contato
+  const digits = valor.replace(/\D/g, "");
+  return digits.includes("@s.whatsapp.net")
+    ? digits
+    : `${digits}@s.whatsapp.net`;
+}
+
 // ====== Baileys / WhatsApp ======
 async function startWhatsApp() {
   if (connState === "connecting" || connState === "open") return;
@@ -46,14 +61,13 @@ async function startWhatsApp() {
   setError(null);
 
   const { state, saveCreds } = await useMultiFileAuthState("auth_info");
-
   const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
     version,
     auth: state,
     browser: Browsers.ubuntu("wa-gateway"),
-    printQRInTerminal: false, // deprecado no baileys novo
+    printQRInTerminal: false,
     markOnlineOnConnect: false,
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
@@ -81,18 +95,14 @@ async function startWhatsApp() {
 
       setError(lastDisconnect?.error || `Connection closed: ${reason}`);
 
-      // limpa QR quando desconectar
       latestQrText = null;
       latestQrDataUrl = null;
 
-      // Reconecta (exceto quando realmente deslogou)
       if (statusCode === DisconnectReason.loggedOut) {
-        // não reconecta automaticamente se deslogou
         connState = "close";
         return;
       }
 
-      // backoff simples
       await sleep(2000);
       startWhatsApp().catch(setError);
     }
@@ -100,9 +110,9 @@ async function startWhatsApp() {
     if (connection === "open") {
       connState = "open";
       setError(null);
-      // QR não precisa mais
       latestQrText = null;
       latestQrDataUrl = null;
+      console.log("[WA] conectado");
     }
   });
 
@@ -112,7 +122,7 @@ async function startWhatsApp() {
 // inicia ao subir
 startWhatsApp().catch(setError);
 
-// ====== Rotas ======
+// ====== Rotas básicas ======
 app.get("/", (req, res) => {
   res.status(200).send("WA Gateway Online");
 });
@@ -126,7 +136,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Retorna o QR em PNG (recomendado)
+// ====== QR ======
 app.get("/qr.png", async (req, res) => {
   if (!latestQrText) {
     return res.status(404).json({
@@ -142,19 +152,23 @@ app.get("/qr.png", async (req, res) => {
     return res.status(200).send(buffer);
   } catch (e) {
     setError(e);
-    return res.status(500).json({ error: "Falha ao gerar QR", detail: lastError });
+    return res.status(500).json({
+      error: "Falha ao gerar QR",
+      detail: lastError,
+    });
   }
 });
 
-// Retorna QR como HTML (pra abrir no navegador e escanear)
 app.get("/qr", (req, res) => {
   if (!latestQrDataUrl) {
     return res.status(404).send(`
-      <html><body style="font-family:Arial;padding:16px;">
-        <h3>QR indisponível</h3>
-        <p>Estado: <b>${connState}</b></p>
-        <pre>${lastError || ""}</pre>
-      </body></html>
+      <html>
+        <body style="font-family:Arial;padding:16px;">
+          <h3>QR indisponível</h3>
+          <p>Estado: <b>${connState}</b></p>
+          <pre>${lastError || ""}</pre>
+        </body>
+      </html>
     `);
   }
 
@@ -170,39 +184,128 @@ app.get("/qr", (req, res) => {
   `);
 });
 
-// Enviar mensagem (pra usar no n8n)
-app.post("/send", async (req, res) => {
+// ====== LISTAR GRUPOS ======
+app.get("/groups", async (req, res) => {
   try {
-    const { to, text } = req.body || {};
-    if (!to || !text) {
-      return res.status(400).json({ error: "Campos obrigatórios: to, text" });
-    }
-
     if (!sock || connState !== "open") {
       return res.status(503).json({
+        ok: false,
         error: "WhatsApp não conectado",
         state: connState,
         detail: lastError,
       });
     }
 
-    // normaliza número -> JID
-    const digits = String(to).replace(/\D/g, "");
-    const jid = digits.includes("@s.whatsapp.net")
-      ? digits
-      : `${digits}@s.whatsapp.net`;
+    const groups = await sock.groupFetchAllParticipating();
 
-    const resp = await sock.sendMessage(jid, { text: String(text) });
+    const result = Object.values(groups)
+      .map((g) => ({
+        id: g.id,
+        name: g.subject,
+        participantsCount: Array.isArray(g.participants) ? g.participants.length : 0,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
 
-    return res.json({ ok: true, jid, messageId: resp?.key?.id || null });
+    return res.json({
+      ok: true,
+      total: result.length,
+      groups: result,
+    });
   } catch (e) {
     setError(e);
-    return res.status(500).json({ ok: false, error: "Falha ao enviar", detail: lastError });
+    return res.status(500).json({
+      ok: false,
+      error: "Falha ao listar grupos",
+      detail: lastError,
+    });
   }
 });
 
-// ====== PORTA (Railway) ======
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+// ====== ENVIAR TEXTO (CONTATO OU GRUPO) ======
+app.post("/send", async (req, res) => {
+  try {
+    const { to, text } = req.body || {};
+
+    if (!to || !text) {
+      return res.status(400).json({
+        ok: false,
+        error: "Campos obrigatórios: to, text",
+      });
+    }
+
+    if (!sock || connState !== "open") {
+      return res.status(503).json({
+        ok: false,
+        error: "WhatsApp não conectado",
+        state: connState,
+        detail: lastError,
+      });
+    }
+
+    const jid = normalizarDestino(to);
+    const resp = await sock.sendMessage(jid, { text: String(text) });
+
+    return res.json({
+      ok: true,
+      to: jid,
+      messageId: resp?.key?.id || null,
+    });
+  } catch (e) {
+    setError(e);
+    return res.status(500).json({
+      ok: false,
+      error: "Falha ao enviar",
+      detail: lastError,
+    });
+  }
+});
+
+// ====== ENVIAR TEXTO ESPECÍFICO PARA GRUPO ======
+app.post("/send-group", async (req, res) => {
+  try {
+    const { groupId, text } = req.body || {};
+
+    if (!groupId || !text) {
+      return res.status(400).json({
+        ok: false,
+        error: "Campos obrigatórios: groupId, text",
+      });
+    }
+
+    if (!String(groupId).endsWith("@g.us")) {
+      return res.status(400).json({
+        ok: false,
+        error: "groupId inválido. Use o formato 1203...@g.us",
+      });
+    }
+
+    if (!sock || connState !== "open") {
+      return res.status(503).json({
+        ok: false,
+        error: "WhatsApp não conectado",
+        state: connState,
+        detail: lastError,
+      });
+    }
+
+    const resp = await sock.sendMessage(String(groupId), { text: String(text) });
+
+    return res.json({
+      ok: true,
+      groupId: String(groupId),
+      messageId: resp?.key?.id || null,
+    });
+  } catch (e) {
+    setError(e);
+    return res.status(500).json({
+      ok: false,
+      error: "Falha ao enviar para grupo",
+      detail: lastError,
+    });
+  }
+});
+
+// ====== START HTTP ======
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 });
