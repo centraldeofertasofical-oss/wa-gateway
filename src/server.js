@@ -10,9 +10,10 @@ import makeWASocket, {
 
 const app = express();
 app.disable("x-powered-by");
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
 
-// ====== PORTA CERTA (Railway) ======
+// Railway usa process.env.PORT.
+// Fallback local:
 const PORT = Number(process.env.PORT || 8080);
 
 // ====== Estado em memória ======
@@ -23,9 +24,10 @@ let latestQrText = null;
 let latestQrDataUrl = null;
 
 let sock = null;
+let isStarting = false;
 
 // ====== Helpers ======
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function setError(err) {
   lastError = err ? String(err?.message || err) : null;
@@ -43,80 +45,99 @@ async function makeQrDataUrl(text) {
 function normalizarDestino(to) {
   const valor = String(to || "").trim();
 
+  if (!valor) return "";
+
   // grupo
   if (valor.endsWith("@g.us")) return valor;
 
-  // contato
+  // contato já normalizado
+  if (valor.endsWith("@s.whatsapp.net")) return valor;
+
+  // contato numérico
   const digits = valor.replace(/\D/g, "");
-  return digits.includes("@s.whatsapp.net")
-    ? digits
-    : `${digits}@s.whatsapp.net`;
+  return `${digits}@s.whatsapp.net`;
 }
 
-// ====== Baileys / WhatsApp ======
-async function startWhatsApp() {
-  if (connState === "connecting" || connState === "open") return;
+function limparQr() {
+  latestQrText = null;
+  latestQrDataUrl = null;
+}
 
+// ====== WhatsApp / Baileys ======
+async function startWhatsApp() {
+  if (isStarting || connState === "open" || connState === "connecting") return;
+
+  isStarting = true;
   connState = "connecting";
   setError(null);
 
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info");
-  const { version } = await fetchLatestBaileysVersion();
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState("auth_info");
+    const { version } = await fetchLatestBaileysVersion();
 
-  sock = makeWASocket({
-    version,
-    auth: state,
-    browser: Browsers.ubuntu("wa-gateway"),
-    printQRInTerminal: false,
-    markOnlineOnConnect: false,
-    syncFullHistory: false,
-    generateHighQualityLinkPreview: false,
-    defaultQueryTimeoutMs: 60_000,
-  });
+    sock = makeWASocket({
+      version,
+      auth: state,
+      browser: Browsers.ubuntu("wa-gateway"),
+      printQRInTerminal: false,
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: true,
+      defaultQueryTimeoutMs: 60_000,
+    });
 
-  sock.ev.on("creds.update", saveCreds);
+    sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
-      latestQrText = qr;
-      latestQrDataUrl = await makeQrDataUrl(qr);
-    }
-
-    if (connection) connState = connection;
-
-    if (connection === "close") {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const reason =
-        statusCode !== undefined
-          ? DisconnectReason[statusCode] || statusCode
-          : "unknown";
-
-      setError(lastDisconnect?.error || `Connection closed: ${reason}`);
-
-      latestQrText = null;
-      latestQrDataUrl = null;
-
-      if (statusCode === DisconnectReason.loggedOut) {
-        connState = "close";
-        return;
+      if (qr) {
+        latestQrText = qr;
+        latestQrDataUrl = await makeQrDataUrl(qr);
       }
 
-      await sleep(2000);
-      startWhatsApp().catch(setError);
-    }
+      if (connection) {
+        connState = connection;
+      }
 
-    if (connection === "open") {
-      connState = "open";
-      setError(null);
-      latestQrText = null;
-      latestQrDataUrl = null;
-      console.log("[WA] conectado");
-    }
-  });
+      if (connection === "open") {
+        connState = "open";
+        setError(null);
+        limparQr();
+        console.log("[WA] conectado");
+      }
 
-  return sock;
+      if (connection === "close") {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const reason =
+          statusCode !== undefined
+            ? DisconnectReason[statusCode] || statusCode
+            : "unknown";
+
+        setError(lastDisconnect?.error || `Connection closed: ${reason}`);
+        limparQr();
+
+        if (statusCode === DisconnectReason.loggedOut) {
+          connState = "close";
+          console.log("[WA] sessão desconectada. Será necessário escanear QR novamente.");
+          return;
+        }
+
+        connState = "close";
+        console.log("[WA] conexão fechada. Reconectando...");
+        await sleep(2000);
+        startWhatsApp().catch(setError);
+      }
+    });
+  } catch (e) {
+    setError(e);
+    connState = "close";
+    console.error("[WA] erro ao iniciar:", e);
+    await sleep(3000);
+    startWhatsApp().catch(setError);
+  } finally {
+    isStarting = false;
+  }
 }
 
 // inicia ao subir
@@ -140,6 +161,7 @@ app.get("/health", (req, res) => {
 app.get("/qr.png", async (req, res) => {
   if (!latestQrText) {
     return res.status(404).json({
+      ok: false,
       error: "QR indisponível",
       state: connState,
       detail: lastError,
@@ -153,6 +175,7 @@ app.get("/qr.png", async (req, res) => {
   } catch (e) {
     setError(e);
     return res.status(500).json({
+      ok: false,
       error: "Falha ao gerar QR",
       detail: lastError,
     });
@@ -254,13 +277,13 @@ app.post("/send", async (req, res) => {
     setError(e);
     return res.status(500).json({
       ok: false,
-      error: "Falha ao enviar",
+      error: "Falha ao enviar texto",
       detail: lastError,
     });
   }
 });
 
-// ====== ENVIAR TEXTO ESPECÍFICO PARA GRUPO ======
+// ====== ENVIAR TEXTO PARA GRUPO ======
 app.post("/send-group", async (req, res) => {
   try {
     const { groupId, text } = req.body || {};
@@ -305,15 +328,15 @@ app.post("/send-group", async (req, res) => {
   }
 });
 
+// ====== ENVIAR IMAGEM (CONTATO OU GRUPO) ======
 app.post("/send-image", async (req, res) => {
   try {
-
-    const { to, imageUrl, caption } = req.body;
+    const { to, imageUrl, caption } = req.body || {};
 
     if (!to || !imageUrl) {
       return res.status(400).json({
         ok: false,
-        error: "Campos obrigatórios: to, imageUrl"
+        error: "Campos obrigatórios: to, imageUrl",
       });
     }
 
@@ -321,37 +344,82 @@ app.post("/send-image", async (req, res) => {
       return res.status(503).json({
         ok: false,
         error: "WhatsApp não conectado",
-        state: connState
+        state: connState,
+        detail: lastError,
       });
     }
 
-    const jid = to.includes("@")
-      ? to
-      : `${to.replace(/\D/g, "")}@s.whatsapp.net`;
+    const jid = normalizarDestino(to);
 
     const msg = await sock.sendMessage(jid, {
-      image: { url: imageUrl },
-      caption: caption || ""
+      image: { url: String(imageUrl) },
+      caption: String(caption || ""),
     });
 
     return res.json({
       ok: true,
-      messageId: msg?.key?.id,
-      to: jid
+      to: jid,
+      messageId: msg?.key?.id || null,
     });
-
-  } catch (err) {
-
-    console.error(err);
-
+  } catch (e) {
+    setError(e);
+    console.error(e);
     return res.status(500).json({
       ok: false,
-      error: "Falha ao enviar imagem"
+      error: "Falha ao enviar imagem",
+      detail: lastError,
     });
-
   }
 });
 
+// ====== ENVIAR IMAGEM ESPECÍFICA PARA GRUPO ======
+app.post("/send-group-image", async (req, res) => {
+  try {
+    const { groupId, imageUrl, caption } = req.body || {};
+
+    if (!groupId || !imageUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: "Campos obrigatórios: groupId, imageUrl",
+      });
+    }
+
+    if (!String(groupId).endsWith("@g.us")) {
+      return res.status(400).json({
+        ok: false,
+        error: "groupId inválido. Use o formato 1203...@g.us",
+      });
+    }
+
+    if (!sock || connState !== "open") {
+      return res.status(503).json({
+        ok: false,
+        error: "WhatsApp não conectado",
+        state: connState,
+        detail: lastError,
+      });
+    }
+
+    const msg = await sock.sendMessage(String(groupId), {
+      image: { url: String(imageUrl) },
+      caption: String(caption || ""),
+    });
+
+    return res.json({
+      ok: true,
+      groupId: String(groupId),
+      messageId: msg?.key?.id || null,
+    });
+  } catch (e) {
+    setError(e);
+    console.error(e);
+    return res.status(500).json({
+      ok: false,
+      error: "Falha ao enviar imagem para grupo",
+      detail: lastError,
+    });
+  }
+});
 
 // ====== START HTTP ======
 app.listen(PORT, "0.0.0.0", () => {
