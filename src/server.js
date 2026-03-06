@@ -305,6 +305,54 @@ app.post("/send-group", async (req, res) => {
   }
 });
 
+app.post("/send-image", async (req, res) => {
+  try {
+
+    const { to, imageUrl, caption } = req.body;
+
+    if (!to || !imageUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: "Campos obrigatórios: to, imageUrl"
+      });
+    }
+
+    if (!sock || connState !== "open") {
+      return res.status(503).json({
+        ok: false,
+        error: "WhatsApp não conectado",
+        state: connState
+      });
+    }
+
+    const jid = to.includes("@")
+      ? to
+      : `${to.replace(/\D/g, "")}@s.whatsapp.net`;
+
+    const msg = await sock.sendMessage(jid, {
+      image: { url: imageUrl },
+      caption: caption || ""
+    });
+
+    return res.json({
+      ok: true,
+      messageId: msg?.key?.id,
+      to: jid
+    });
+
+  } catch (err) {
+
+    console.error(err);
+
+    return res.status(500).json({
+      ok: false,
+      error: "Falha ao enviar imagem"
+    });
+
+  }
+});
+
+
 // ====== START HTTP ======
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Servidor rodando na porta ${PORT}`);
